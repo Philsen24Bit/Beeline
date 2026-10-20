@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WatchNav v16</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 20px; background: #111; color: #eee; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  button, input { font-size: 18px; padding: 14px; width: 100%; box-sizing: border-box; margin-bottom: 12px;
+                  border-radius: 10px; border: 1px solid #444; background: #222; color: #eee; }
+  button { background: #2a6df4; border: none; color: #fff; font-weight: 600; }
+  button:disabled { background: #333; color: #777; }
+  #status { color: #9ab; margin: 8px 0 20px; min-height: 1.4em; }
+  #dist { font-size: 56px; font-weight: 700; color: #ffd400; text-align: center; margin-top: 24px; }
+  #text { font-size: 24px; text-align: center; margin-top: 8px; }
+  #info { font-size: 14px; color: #789; text-align: center; margin-top: 16px; line-height: 1.6; }
+  #log { font-size: 12px; color: #6a8; background: #0b0b0b; border-radius: 8px; padding: 10px; margin-top: 16px; white-space: pre-wrap; min-height: 3em; }
+</style>
+</head>
+<body>
+<h1>WatchNav – StopWatch-Navigation <small style="color:#789;font-weight:400">Seite v16</small></h1>
+<button id="btnConnect">1. Uhr verbinden</button>
+<input id="dest" placeholder="Ziel (Adresse oder Ort)" autocomplete="off">
+<button id="btnStart" disabled>2. Navigation starten</button>
+<div id="batRow" style="display:none"><input id="phoneBat" type="number" inputmode="numeric" min="0" max="100" placeholder="iPhone-Akku in % (manuell)"></div>
+<div id="status">Bereit.</div>
+<div id="dist"></div>
+<div id="text"></div>
+<div id="info"></div>
+<pre id="log">Protokoll</pre>
+
+<script>
+// UUIDs müssen zum Sketch passen
+const SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const PAGE_VERSION = 'v16';
+const CHR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // Uhr empfängt (schreiben)
+const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // Uhr antwortet (Bestätigungen)
+
+// ---- CORE-BEGIN (Routen- und Kartenlogik ohne Browser-Abhängigkeit) ----
+const RAD = Math.PI / 180, R_EARTH = 6371000;
+const LANE_RANGE = 800;                 // Spurdaten erst ab dieser Entfernung zum Manöver [m]
+const ROUTE_AHEAD = 3400;               // so weit voraus wird die Route für die Karte gesendet [m]
+const SET_REFRESH_M = 200;              // neuer Kartenausschnitt, wenn so weit gefahren [m]
+let geom = [], cumD = [], steps = [], stepStart = [], routeDuration = 0, limitSegs = [], camProgs = [];
+let cur = 1, prog = 0, segIdx = 0;
+
+function dist2(a, b) {
+  const dp = (b.lat - a.lat) * RAD, dl = (b.lon - a.lon) * RAD;
+  const h = Math.sin(dp / 2) ** 2 + Math.cos(a.lat * RAD) * Math.cos(b.lat * RAD) * Math.sin(dl / 2) ** 2;
+  return 2 * R_EARTH * Math.asin(Math.sqrt(h));
+}
+function xy(p, ref) {                   // lokale Meter (x = Ost, y = Nord) von p relativ zu ref
+  return { x: (p.lon - ref.lon) * RAD * R_EARTH * Math.cos(ref.lat * RAD), y: (p.lat - ref.lat) * RAD * R_EARTH };
+}
+
+function setRoute(coords, stepList, duration) {   // coords: [[lon,lat],...], duration: Fahrzeit in s
+  routeDuration = duration || 0;
+  geom = coords.map(c => ({ lat: c[1], lon: c[0] }));
+  cumD = [0];
+  for (let i = 1; i < geom.length; i++) cumD.push(cumD[i - 1] + dist2(geom[i - 1], geom[i]));
+  steps = stepList;
+  let acc = 0;
+  const raw = steps.map(s => { const v = acc; acc += s.distance; return v; });
+  const k = acc > 0 ? cumD[cumD.length - 1] / acc : 1;      // Schrittlängen an die Geometrie anpassen
+  stepStart = raw.map(v => v * k);
+  cur = steps.length > 1 ? 1 : 0; prog = 0; segIdx = 0;
+}
+
+// Tempolimit entlang der Route aus OpenStreetMap (maxspeed-Tag der Straße, auf der die Route verläuft).
+// limitSegs: [{from, to, kmh}] in Metern entlang der Route; kmh 0 = kein Limit / unbekannt -> die Uhr zeigt kein Schild.
+function parseMaxspeed(v) {              // null = unbekannt/ungültig, 0 = ausdrücklich kein Limit
+  if (v === undefined || v === null) return null;
+  v = String(v).trim().toLowerCase();
+  if (v === 'none' || v === 'signals' || v === 'variable' || v === 'de:motorway') return 0;
+  if (v === 'walk' || v === 'de:living_street') return 7;
+  if (v === 'de:urban') return 50;
+  if (v === 'de:rural') return 100;
+  let m = v.match(/^(\d{1,3})\s*(mph)?$/);
+  if (m) { let k = parseInt(m[1]); if (m[2]) k = Math.round(k * 1.609); return (k >= 5 && k <= 150) ? k : null; }
+  m = v.match(/^[a-z]{2}:(?:zone:?)?(\d{2,3})$/);                                   // z. B. "DE:zone30"
+  if (m) { const k = parseInt(m[1]); return (k >= 5 && k <= 150) ? k : null; }
+  return null;
+}
+function nearestSeg(P, pts) {            // nächstes Teilstück eines Linienzugs: Abstand + Richtung (lokale Meter)
+  let best = { d: 1e12, ux: 0, uy: 0 };
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const d = perpDist(P, pts[i], pts[i + 1]);
+    if (d < best.d) {
+      const l = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y) || 1;
+      best = { d, ux: (pts[i + 1].x - pts[i].x) / l, uy: (pts[i + 1].y - pts[i].y) / l };
+    }
+  }
+  return best;
+}
+function overpassLimitQuery(points) {    // alle Straßen mit maxspeed in 20 m Umkreis der Route
+  const list = points.map(q => q.lat.toFixed(5) + ',' + q.lon.toFixed(5)).join(',');
+  return '[out:json][timeout:20];way["highway"]["maxspeed"](around:20,' + list + ');out tags geom;';
+}
+function buildLimits(elements, prog0, range) {       // Abschnitte [prog0, prog0+range] mit Tempolimit
+  const p0 = pointAt(prog0), ways = [];
+  for (const w of elements) {
+    try {
+      if (w.type !== 'way' || !w.geometry || !w.tags) continue;
+      const k = parseMaxspeed(w.tags.maxspeed);
+      if (k === null) continue;
+      const pts = w.geometry.filter(g => g && typeof g.lat === 'number').map(g => xy(g, p0));
+      if (pts.length >= 2) ways.push({ k, pts });
+    } catch (e) { /* kaputte Straße überspringen */ }
+  }
+  const end = Math.min(cumD[cumD.length - 1], prog0 + range), segs = [];
+  let curK = -1, start = prog0;
+  for (let s = prog0; s <= end; s += 20) {           // alle 20 m: Straße unter der Route suchen
+    const P = xy(pointAt(s), p0), Q = xy(pointAt(Math.min(end, s + 20)), p0);
+    const rx = Q.x - P.x, ry = Q.y - P.y, rl = Math.hypot(rx, ry);
+    let best = 1e9, bk = 0;
+    for (const w of ways) {
+      const n = nearestSeg(P, w.pts);
+      if (rl > 1 && Math.abs(n.ux * rx + n.uy * ry) / rl < 0.82) continue;     // Querstraße (> ca. 35° Abweichung): ignorieren
+      if (n.d < best) { best = n.d; bk = w.k; }
+    }
+    const k = best <= 20 ? bk : 0;
+    if (k !== curK) { if (curK >= 0) segs.push({ from: start, to: s, kmh: curK }); curK = k; start = s; }
+  }
+  if (curK >= 0) segs.push({ from: start, to: end, kmh: curK });
+  return segs;
+}
+function mergeLimits(segs, from, to) {               // neue Abschnitte in die Liste einsetzen
+  limitSegs = limitSegs.filter(x => x.to <= from || x.from >= to).concat(segs).sort((a, b) => a.from - b.from);
+}
+// Blitzer (feste Anlagen aus OpenStreetMap: highway=speed_camera). camProgs = Streckenpositionen [m] auf der Route.
+function overpassCamQuery(points) {
+  const list = points.map(q => q.lat.toFixed(5) + ',' + q.lon.toFixed(5)).join(',');
+  return '[out:json][timeout:20];node["highway"="speed_camera"](around:30,' + list + ');out;';
+}
+function buildCams(elements, sampleProgs, samplePts, prog0, end) {   // jeden Blitzer dem nächsten Routen-Stützpunkt zuordnen
+  const out = [];
+  for (const e of elements) {
+    if (e.type !== 'node' || typeof e.lat !== 'number') continue;
+    let best = 1e9, bp = 0;
+    for (let i = 0; i < samplePts.length; i++) {
+      const v = xy(e, samplePts[i]), d = Math.hypot(v.x, v.y);
+      if (d < best) { best = d; bp = sampleProgs[i]; }
+    }
+    if (best <= 60) out.push(bp);
+  }
+  return out;
+}
+function mergeCams(list, from, to) {
+  camProgs = camProgs.filter(x => x < from || x > to).concat(list).sort((a, b) => a - b);
+}
+function camAhead(p) {                                 // Entfernung zum nächsten Blitzer voraus (m), 0 = keiner innerhalb 1,5 km
+  for (const c of camProgs) if (c >= p - 15) return (c - p) <= 1500 ? Math.max(1, Math.round(c - p)) : 0;
+  return 0;
+}
+function limitAt(p) {
+  for (const s of limitSegs) if (p >= s.from && p < s.to) return s.kmh;
+  return 0;
+}
+
+function segAt(s) {                     // Segmentindex für Streckenlänge s
+  let lo = 0, hi = geom.length - 2;
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (cumD[m] <= s) lo = m; else hi = m - 1; }
+  return lo;
+}
+function pointAt(s) {
+  s = Math.max(0, Math.min(cumD[cumD.length - 1], s));
+  const i = segAt(s), l = cumD[i + 1] - cumD[i], t = l > 0 ? (s - cumD[i]) / l : 0;
+  return { lat: geom[i].lat + (geom[i + 1].lat - geom[i].lat) * t, lon: geom[i].lon + (geom[i + 1].lon - geom[i].lon) * t };
+}
+
+// Position auf die Route projizieren (Suchfenster um den bisherigen Fortschritt)
+function snap(pos) {
+  const i0 = Math.max(0, segIdx - 3), i1 = Math.min(geom.length - 2, segIdx + 150);
+  let best = { d: 1e12, i: segIdx, prog: prog };
+  for (let i = i0; i <= i1; i++) {
+    const a = xy(geom[i], pos), b = xy(geom[i + 1], pos);   // pos liegt im Ursprung
+    const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
+    let t = l2 > 0 ? -(a.x * dx + a.y * dy) / l2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    const d = Math.hypot(a.x + t * dx, a.y + t * dy);
+    if (d < best.d) best = { d, i, prog: cumD[i] + t * (cumD[i + 1] - cumD[i]) };
+  }
+  return best;
+}
+
+// ---------- Nachrichten an die Uhr ----------
+// Prüfsumme: Summe der Bytes mod 256, als "*HH" angehängt (die Uhr verwirft beschädigte Zeilen)
+function withSum(msg) {
+  let sum = 0;
+  for (const b of new TextEncoder().encode(msg)) sum = (sum + b) & 255;
+  return msg + '*' + sum.toString(16).toUpperCase().padStart(2, '0');
+}
+
+// Punkte als Differenzen codieren: erster Punkt absolut, danach nur die Schritte (spart Bluetooth-Daten)
+function encPts(pts) {
+  let px = 0, py = 0;
+  return pts.map((q, i) => {
+    const x = Math.round(q.x), y = Math.round(q.y);
+    const s = i === 0 ? x + ',' + y : (x - px) + ',' + (y - py);
+    px = x; py = y;
+    return s;
+  }).join(';');
+}
+
+// Reise-Daten für Tempo-, Reise- und Kompass-Ansicht der Uhr:
+// T|km/h|Kompasswinkel|Luftlinie m|Rest m|Rest s|Uhrzeit (Minuten seit Mitternacht)|Gesamt m|Fahrtrichtung|Tempolimit
+function buildTripMsg(speedMs, destPt, nowMin) {
+  const total = cumD[cumD.length - 1];
+  const p0 = pointAt(prog);
+  const fwd = xy(pointAt(prog + 40), p0);
+  const hdg = (Math.abs(fwd.x) + Math.abs(fwd.y) < 1) ? 0 : Math.atan2(fwd.x, fwd.y);       // Fahrtrichtung laut Route
+  const dv = xy(destPt, p0);
+  const toDest = Math.atan2(dv.x, dv.y);
+  let rel = (toDest - hdg) / RAD;                                                              // Richtung zum Ziel relativ zur Fahrt
+  rel = ((rel + 540) % 360) - 180;                                                             // -180 .. +180
+  const hdgDeg = ((hdg / RAD) + 360) % 360;
+  const remM = Math.max(0, total - prog);
+  const remS = total > 0 ? routeDuration * remM / total : 0;
+  return 'T|' + Math.round(speedMs * 3.6) + '|' + Math.round(rel) + '|' + Math.round(Math.hypot(dv.x, dv.y)) + '|' +
+         Math.round(remM) + '|' + Math.round(remS) + '|' + Math.round(nowMin) + '|' + Math.round(total) + '|' + Math.round(hdgDeg) + '|' + limitAt(prog) + '|' + camAhead(prog);
+}
+
+// Spurinfo (OSRM liefert sie nur dort, wo OpenStreetMap turn:lanes-Daten hat)
+const LANE_CODE = { 'sharp left': 'a', 'left': 'b', 'slight left': 'c', 'straight': 'd',
+                    'slight right': 'e', 'right': 'f', 'sharp right': 'g', 'uturn': 'u', 'none': 'n' };
+function buildLaneMsg(dAlong) {
+  const st = steps[cur];
+  const lanes = st && st.intersections && st.intersections[0] && st.intersections[0].lanes;
+  if (!lanes || !lanes.length || dAlong > LANE_RANGE) return 'L|-';
+  return 'L|' + lanes.map(l => (l.valid ? '1' : '0') + (l.indications || []).map(i => LANE_CODE[i] || 'n').join('')).join(',');
+}
+
+// ---------- Straßen aus OpenStreetMap (Overpass) ----------
+// Klassen: 0 Autobahn, 1 Fernstraße/Bundesstraße, 2 Landesstraße, 3 Kreisstraße, 4 kleine Straßen
+const KIND_OF = { motorway: 0, trunk: 1, primary: 1, motorway_link: 1, secondary: 2, trunk_link: 2, primary_link: 2,
+                  tertiary: 3, secondary_link: 3, tertiary_link: 4, residential: 4, unclassified: 4, living_street: 4 };
+const KIND_BUDGET = [10, 16, 20, 24, 32];  // höchstens so viele Straßen je Klasse (insgesamt 66; die Uhr nimmt bis zu 80)  // höchstens so viele Straßen je Klasse (begrenzt die Datenmenge)
+const CLIP_M = 3800, MAX_ROAD_PTS = 6;
+
+// Zwei Stufen: "klein" (schnell, ~450 m Ausschnitt, alle Straßenklassen) und "voll" (große Straßen weiter hinaus).
+// Rechteck-Filter ist für den Server viel schneller als "around"; out geom(bbox) liefert nur Punkte im Ausschnitt.
+function bboxStr(p, m) {
+  const dLat = m / 110540, dLon = m / (111320 * Math.cos(p.lat * RAD));
+  return [p.lat - dLat, p.lon - dLon, p.lat + dLat, p.lon + dLon].map(v => v.toFixed(5)).join(',');
+}
+function overpassQuery(p, small) {
+  const ALL = 'motorway|trunk|primary|secondary|tertiary|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link|residential|unclassified|living_street';
+  const body = small
+    ? `way["highway"~"^(${ALL})$"](${bboxStr(p, 450)});`
+    : `way["highway"~"^(motorway|trunk|primary|secondary)$"](${bboxStr(p, 3600)});` +
+      `way["highway"~"^(motorway_link|trunk_link|primary_link|secondary_link|tertiary)$"](${bboxStr(p, 3000)});` +
+      `way["highway"~"^(tertiary_link|residential|unclassified|living_street)$"](${bboxStr(p, 1200)});`;
+  return '[out:json][timeout:25];(' + body + `);out tags geom(${bboxStr(p, small ? 450 : 3600)});`;
+}
+
+function clean(s, n) {                  // Trennzeichen des Protokolls entfernen, kürzen
+  if (!s) return '';
+  s = String(s).replace(/[|;,*\n\r]/g, ' ').trim();
+  return s.length > n ? s.slice(0, n - 1) + '.' : s;
+}
+function firstRef(s) { return s ? clean(String(s).split(';')[0].replace(/\s+/g, ''), 6) : ''; }
+
+function perpDist(p, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
+  if (!l2) return Math.hypot(p.x - a.x, p.y - a.y);
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2));
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
+function rdp(pts, tol) {                // Ramer-Douglas-Peucker
+  if (pts.length < 3) return pts;
+  let dmax = 0, idx = 0;
+  for (let i = 1; i < pts.length - 1; i++) { const d = perpDist(pts[i], pts[0], pts[pts.length - 1]); if (d > dmax) { dmax = d; idx = i; } }
+  if (dmax > tol) return rdp(pts.slice(0, idx + 1), tol).slice(0, -1).concat(rdp(pts.slice(idx), tol));
+  return [pts[0], pts[pts.length - 1]];
+}
+function simplify(pts, maxN) {
+  let tol = 6, out = rdp(pts, tol);
+  while (out.length > maxN && tol < 600) { tol *= 1.6; out = rdp(pts, tol); }
+  return out;
+}
+function clipRun(pts, lim) {            // längster Abschnitt innerhalb des Radius (+ je ein Nachbarpunkt)
+  let best = null, start = -1;
+  for (let i = 0; i <= pts.length; i++) {
+    const inside = i < pts.length && Math.hypot(pts[i].x, pts[i].y) <= lim;
+    if (inside && start < 0) start = i;
+    if (!inside && start >= 0) { if (!best || i - start > best[1] - best[0]) best = [start, i]; start = -1; }
+  }
+  if (!best) return [];
+  return pts.slice(Math.max(0, best[0] - 1), Math.min(pts.length, best[1] + 1));
+}
+
+function longestRun(geometry) {          // out geom(bbox) liefert für Punkte außerhalb des Ausschnitts "null" -> längsten zusammenhängenden Abschnitt nehmen
+  let best = [], run = [];
+  for (const g of geometry) {
+    if (g && typeof g.lat === 'number' && typeof g.lon === 'number') run.push(g);
+    else { if (run.length > best.length) best = run; run = []; }
+  }
+  return run.length > best.length ? run : best;
+}
+
+function processRoads(elements, p0) {
+  const per = [[], [], [], [], []];
+  for (const w of elements) {
+    try {
+      if (w.type !== 'way' || !w.geometry || !w.tags) continue;
+      const kind = KIND_OF[w.tags.highway];
+      if (kind === undefined) continue;
+      let pts = clipRun(longestRun(w.geometry).map(g => xy(g, p0)), CLIP_M);
+      if (pts.length < 2) continue;
+      const dmin = nearestSeg({ x: 0, y: 0 }, pts).d;              // Abstand zur Straßenlinie (nicht nur zu ihren Punkten)
+      pts = simplify(pts, MAX_ROAD_PTS);
+      per[kind].push({ kind, dmin, ref: firstRef(w.tags.ref), name: (kind <= 3 || dmin < 550) ? clean(w.tags.name, 18) : '', pts });
+    } catch (e) { /* eine kaputte Straße darf nicht die ganze Karte verhindern */ }
+  }
+  const out = [];
+  per.forEach((list, k) => { list.sort((a, b) => a.dmin - b.dmin); out.push(...list.slice(0, KIND_BUDGET[k])); });
+  return out;
+}
+
+// Kompletter Kartensatz: Anker = aktuelle Position, alle Punkte in Metern (Ost/Nord) relativ dazu
+function buildSetMsgs(k, p0, prog0, roads) {
+  const total = cumD[cumD.length - 1];
+  const rpts = [];
+  let sd = 0, end = 0;
+  for (;;) {
+    rpts.push(xy(pointAt(prog0 + sd), p0));
+    if (prog0 + sd >= total) { end = 1; break; }
+    if (sd >= ROUTE_AHEAD || rpts.length >= 60) break;
+    sd += sd < 300 ? 20 : (sd < 1000 ? 50 : 120);     // nah dicht, weit voraus gröber (max. 64 Punkte auf der Uhr)
+  }
+  const msgs = ['W|' + k, 'Q|' + k + '|' + end + '|' + encPts(rpts)];
+  for (const r of roads) msgs.push('R|' + k + '|' + r.kind + '|' + r.ref + '|' + r.name + '|' + encPts(r.pts));
+  msgs.push('X|' + k + '|' + roads.length);      // Anzahl: die Uhr übernimmt den Satz nur, wenn alles da ist
+  return msgs;
+}
+
+const MOD = { 'left': 'links', 'right': 'rechts', 'slight left': 'leicht links', 'slight right': 'leicht rechts',
+              'sharp left': 'scharf links', 'sharp right': 'scharf rechts' };
+const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+function instruction(s) {               // OSRM-Manöver -> deutscher Text
+  const m = s.maneuver, t = m.type, mod = m.modifier || '', on = s.name ? ' auf ' + s.name : '';
+  if (t === 'depart') return 'Losfahren' + on;
+  if (t === 'arrive') return 'Ziel erreicht';
+  if (t.startsWith('roundabout') || t === 'rotary') return m.exit ? `Im Kreisverkehr ${m.exit}. Ausfahrt${on}` : 'Kreisverkehr' + on;
+  if (mod === 'uturn') return 'Wenden';
+  if (t === 'merge') return 'Einfädeln' + on;
+  if (t === 'on ramp') return 'Auffahrt nehmen' + on;
+  if (t === 'off ramp') return 'Abfahrt nehmen' + on;
+  if (t === 'fork') return `Halte dich ${MOD[mod] || mod}${on}`;
+  if (MOD[mod]) return cap(MOD[mod]) + ' abbiegen' + on;
+  return 'Geradeaus' + on;
+}
+// ---- CORE-END ----
+
+const REROUTE_M = 120, REACHED_M = 25, PASSED_M = 15;
+let chr = null, pos = null, dest = null;
+let busy = false, gpsStarted = false, firstFix = null, offCount = 0, arrived = false;
+let activeK = 0, anchorProg = 0, kCounter = 0, building = false, roadsRetryAt = 0, roadsMissing = false;
+let ackSupported = false, pendingAck = null, lastSetMsgs = [], needSet = false, retryAfter = 0;
+let limitCoverTo = 0, limitRetryAt = 0, limitBusy = false;
+let roadLevel = 0, inFlight = false;       // roadLevel: 0 keine Straßen, 1 kleiner Ausschnitt, 2 voller Ausschnitt
+let ACK_TIMEOUT_MS = 6000;
+let speed = 0, prevProg = 0, prevT = 0;
+const anchors = {};
+
+const $ = id => document.getElementById(id);
+const setStatus = t => $('status').textContent = t;
+const logLines = [];
+function log(t) {                              // kleines Protokoll auf der Seite (hilft bei der Fehlersuche)
+  logLines.push(new Date().toLocaleTimeString('de-DE') + ' ' + t);
+  if (logLines.length > 8) logLines.shift();
+  $('log').textContent = logLines.join('\n');
+}
+// Häppchengröße: startet mit 20 Byte (immer sicher). Nach der ersten bestätigten Karte wird einmal 100 Byte probiert.
+const chunkParam = parseInt(new URLSearchParams(location.search).get('chunk'));
+let chunkSize = chunkParam || 20, okChunk = 0, triedBigger = false;   // startet sicher mit 20 Byte
+
+// ---------- Bluetooth: Ausgangswarteschlange ----------
+// Wichtige Nachrichten (N Anweisung, L Spuren, P Position) haben Vorrang; der Kartensatz läuft dazwischen mit.
+const outbox = {}, lastSent = {};
+let setQueue = [], pumping = false;
+
+async function connectWatch() {
+  if (!navigator.bluetooth) { setStatus('Kein Web Bluetooth – bitte den Browser "Bluefy" verwenden.'); return; }
+  try {
+    const dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    dev.addEventListener('gattserverdisconnected', () => {
+      chr = null; activeK = 0;
+      if (pendingAck) { clearTimeout(pendingAck.timer); pendingAck = null; }
+      setStatus('Uhr getrennt – bitte neu verbinden.');
+    });
+    const srv = await dev.gatt.connect();
+    const svc = await srv.getPrimaryService(SVC);
+    chr = await svc.getCharacteristic(CHR);
+    try {                                                  // Rückkanal: die Uhr bestätigt angekommene Kartensätze
+      const tx = await svc.getCharacteristic(TX);
+      await tx.startNotifications();
+      tx.addEventListener('characteristicvaluechanged', onNotify);
+      ackSupported = true;
+      log('Seite ' + PAGE_VERSION + ' · Rückkanal der Uhr aktiv (Häppchen: ' + chunkSize + ' Byte)');
+    } catch (e) {
+      ackSupported = false;
+      log('Seite ' + PAGE_VERSION + ' · Kein Rückkanal – läuft die NEUE Sketch-Version auf der Uhr? (Sie zeigt "Sketch v18" in der Info-Ansicht)');
+    }
+    $('btnStart').disabled = false;
+    setStatus('Uhr verbunden.');
+    startGps();
+    initPhoneBattery();
+  } catch (e) { setStatus('Verbindung fehlgeschlagen: ' + e.message); }
+}
+
+function onNotify(ev) {                                    // Antwort der Uhr: "A|<Satz>|<fehlerhafte Zeilen>"
+  const f = new TextDecoder().decode(ev.target.value).trim().split('|');
+  if (f[0] === 'A' && pendingAck && parseInt(f[1]) === pendingAck.k) {
+    clearTimeout(pendingAck.timer);
+    activeK = pendingAck.k; anchorProg = anchors[activeK];
+    pendingAck = null; needSet = false;
+    okChunk = chunkSize;
+    log('Karte auf der Uhr angekommen · Uhr-Sketch ' + (f[3] || '?') + (parseInt(f[2]) > 0 ? ' · ' + f[2] + ' fehlerhafte Zeilen bisher' : ''));
+    if (!chunkParam && !triedBigger && chunkSize < 100) { triedBigger = true; chunkSize = 100; log('Nächster Satz: Test mit 100-Byte-Häppchen'); }
+  }
+}
+
+// Satz komplett gesendet -> auf Bestätigung der Uhr warten; ohne Bestätigung kleinere Häppchen und erneut senden
+function onSetSent(k) {
+  inFlight = false;
+  if (!ackSupported) { activeK = k; anchorProg = anchors[k]; log('Kartensatz gesendet (ohne Bestätigung)'); return; }
+  const tries = pendingAck && pendingAck.k === k ? pendingAck.tries : 0;
+  if (pendingAck) clearTimeout(pendingAck.timer);
+  pendingAck = { k, tries, timer: setTimeout(onAckTimeout, ACK_TIMEOUT_MS) };
+}
+function onAckTimeout() {
+  const p = pendingAck;
+  if (!p) return;
+  p.tries++;
+  if (p.tries > 3) {
+    pendingAck = null; needSet = true; retryAfter = Date.now() + 20000;
+    log('Keine Bestätigung der Uhr – neuer Versuch in 20 s');
+    return;
+  }
+  chunkSize = okChunk || (chunkSize > 60 ? 60 : 20);                 // zurück auf das, was nachweislich funktionierte
+  log('Keine Bestätigung – sende erneut mit ' + chunkSize + '-Byte-Häppchen (Versuch ' + (p.tries + 1) + ')');
+  setQueue = lastSetMsgs.slice();
+  pump();
+}
+
+function post(type, msg) {
+  if (lastSent[type] === msg) return;
+  outbox[type] = msg;
+  pump();
+}
+async function writeLine(msg) {
+  const bytes = new TextEncoder().encode(withSum(msg) + '\n');
+  for (let i = 0; i < bytes.length;) {
+    const chunk = bytes.slice(i, i + chunkSize);
+    try {
+      if (chr.writeValueWithoutResponse) await chr.writeValueWithoutResponse(chunk); else await chr.writeValue(chunk);
+      i += chunk.length;
+    } catch (e) {
+      if (chunkSize > 20) { chunkSize = 20; continue; }    // zu große Häppchen -> auf 20 Byte zurück
+      throw e;
+    }
+  }
+}
+async function pump() {
+  if (pumping || !chr) return;
+  pumping = true;
+  try {
+    for (;;) {
+      const t = ['N', 'L', 'T', 'P', 'B'].find(k => outbox[k] !== undefined);
+      let msg;
+      if (t) { msg = outbox[t]; delete outbox[t]; lastSent[t] = msg; }
+      else if (setQueue.length) msg = setQueue.shift();
+      else break;
+      await writeLine(msg);
+      if (msg.startsWith('X|')) onSetSent(parseInt(msg.slice(2)));                      // Satz komplett gesendet
+    }
+  } catch (e) {
+    for (const k in lastSent) lastSent[k] = '';
+    setQueue = []; needSet = true; retryAfter = Date.now() + 5000; inFlight = false;
+    log('Sendefehler: ' + e.message);
+  }
+  pumping = false;
+}
+
+// ---------- iPhone-Akku ----------
+// Safari und Bluefy (iOS) stellen den Akkustand einer Webseite NICHT zur Verfügung (keine Battery-API).
+// Falls der Browser ihn doch liefert, wird er automatisch gesendet; sonst trägst du ihn unten von Hand ein.
+let phoneBat = -1, phoneChg = 0;
+function sendBat() { if (phoneBat >= 0) post('B', 'B|' + phoneBat + '|' + phoneChg); }
+async function initPhoneBattery() {
+  if (navigator.getBattery) {
+    try {
+      const b = await navigator.getBattery();
+      const upd = () => { phoneBat = Math.round(b.level * 100); phoneChg = b.charging ? 1 : 0; sendBat(); };
+      b.addEventListener('levelchange', upd); b.addEventListener('chargingchange', upd); upd();
+      log('iPhone-Akku wird automatisch gelesen: ' + phoneBat + ' %');
+      return;
+    } catch (e) { /* weiter mit manuell */ }
+  }
+  $('batRow').style.display = 'block';
+  log('iPhone-Akku: Browser liefert ihn nicht – bitte unter "Navigation starten" von Hand eintragen');
+}
+$('phoneBat').oninput = () => {
+  const v = parseInt($('phoneBat').value);
+  if (v >= 0 && v <= 100) { phoneBat = v; phoneChg = 0; sendBat(); }
+};
+setInterval(() => { if (chr && phoneBat >= 0) { lastSent['B'] = ''; sendBat(); } }, 60000);   // regelmäßig erneut senden
+
+// ---------- GPS ----------
+function startGps() {
+  if (gpsStarted) return;
+  gpsStarted = true;
+  firstFix = new Promise(res => {
+    navigator.geolocation.watchPosition(p => { pos = { lat: p.coords.latitude, lon: p.coords.longitude }; res(); onPos(); },
+      e => setStatus('GPS-Fehler: ' + e.message), { enableHighAccuracy: true, maximumAge: 0 });
+  });
+}
+async function keepAwake() { try { await navigator.wakeLock.request('screen'); } catch (e) {} }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && steps.length) keepAwake(); });
+
+// ---------- Ziel + Route ----------
+async function geocode(q) {
+  let url = 'https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(q);
+  if (pos) url += `&viewbox=${pos.lon - 0.5},${pos.lat + 0.5},${pos.lon + 0.5},${pos.lat - 0.5}`;
+  const j = await (await fetch(url)).json();
+  if (!j.length) throw new Error('Ziel nicht gefunden');
+  return { lat: parseFloat(j[0].lat), lon: parseFloat(j[0].lon) };
+}
+
+async function route() {
+  if (busy || !dest || !pos) return;
+  busy = true;
+  try {
+    const url = `https://router.project-osrm.org/route/v1/driving/${pos.lon},${pos.lat};${dest.lon},${dest.lat}?overview=full&geometries=geojson&steps=true`;
+    const j = await (await fetch(url)).json();
+    if (!j.routes || !j.routes.length) throw new Error('Keine Route gefunden');
+    const r = j.routes[0];
+    setRoute(r.geometry.coordinates, r.legs.flatMap(l => l.steps), r.duration);
+    limitSegs = []; camProgs = []; limitCoverTo = 0; limitRetryAt = 0;      // Tempolimits für die neue Route neu laden
+    arrived = false; offCount = 0; prevProg = 0; prevT = 0; speed = 0;
+    activeK = 0; setQueue = []; roadsMissing = false; roadLevel = 0; inFlight = false;   // alter Kartensatz passt nicht mehr
+    if (pendingAck) { clearTimeout(pendingAck.timer); pendingAck = null; }
+    for (const k in lastSent) lastSent[k] = '';
+    setStatus('Navigation läuft.');
+    post('N', '0|' + instruction(steps[0]));
+  } catch (e) { setStatus('Fehler: ' + e.message); }
+  busy = false;
+}
+
+async function startNav() {
+  const q = $('dest').value.trim();
+  if (!q) return;
+  setStatus('Suche Ziel...');
+  keepAwake();
+  try {
+    await firstFix;
+    dest = await geocode(q);
+    await route();
+  } catch (e) { setStatus('Fehler: ' + e.message); }
+}
+
+// ---------- Kartensatz (Straßen + Route) holen und senden ----------
+const OVERPASS = ['https://overpass-api.de/api/interpreter',
+                  'https://overpass.kumi.systems/api/interpreter',
+                  'https://overpass.private.coffee/api/interpreter',
+                  'https://overpass.openstreetmap.fr/api/interpreter'];
+// Alle Server gleichzeitig fragen, die erste brauchbare Antwort gewinnt (öffentliche Server sind oft überlastet)
+async function overpassJson(query) {
+  const body = 'data=' + encodeURIComponent(query);
+  const ctls = [];
+  let finished = false;
+  const attempt = (url) => {
+    const host = url.split('/')[2];
+    const ctl = new AbortController(); ctls.push(ctl);
+    const to = setTimeout(() => ctl.abort(), 25000);
+    return fetch(url, { method: 'POST', signal: ctl.signal, body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
+      .then(async r => { if (!r.ok) throw new Error(host + ' ' + r.status); return (await r.json()).elements || []; })
+      .catch(e => { if (!finished) log('Server ' + host + ': ' + (e.name === 'AbortError' ? 'Zeitüberschreitung' : e.message)); throw e; })
+      .finally(() => clearTimeout(to));
+  };
+  try { return await Promise.any(OVERPASS.map(attempt)); }
+  catch (e) { throw new Error('alle Server nicht erreichbar'); }
+  finally { finished = true; ctls.forEach(c => c.abort()); }
+}
+async function fetchRoads(p0, small) { return processRoads(await overpassJson(overpassQuery(p0, small)), p0); }
+
+// Tempolimits für die nächsten 2 km holen (im Hintergrund, unabhängig vom Kartensatz)
+async function refreshLimits() {
+  if (limitBusy || !geom.length) return;
+  limitBusy = true;
+  const prog0 = prog;
+  try {
+    const end = Math.min(cumD[cumD.length - 1], prog0 + 2000);
+    if (end - prog0 < 30) { limitCoverTo = end; return; }
+    const pts = [], sp = [];
+    for (let s = prog0; s < end; s += 50) { pts.push(pointAt(s)); sp.push(s); }
+    pts.push(pointAt(end)); sp.push(end);
+    overpassJson(overpassCamQuery(pts)).then(el => {            // Blitzer getrennt laden: Fehler hier stört die Tempolimits nicht
+      const c = buildCams(el, sp, pts, prog0, end);
+      mergeCams(c, prog0, end);
+      log('Blitzer voraus (OpenStreetMap): ' + (c.length ? c.length + ' Stück' : 'keine eingetragen'));
+    }).catch(e => log('Blitzer: ' + e.message));
+    const segs = buildLimits(await overpassJson(overpassLimitQuery(pts)), prog0, end - prog0);
+    mergeLimits(segs, prog0, end);
+    limitCoverTo = end;
+    const known = segs.filter(x => x.kmh > 0);
+    log('Tempolimits voraus: ' + (known.length ? known.length + ' Abschnitte, jetzt ' + (limitAt(prog) || 'kein Limit') : 'in OpenStreetMap keine eingetragen'));
+  } catch (e) {
+    limitRetryAt = Date.now() + 20000;
+    log('Tempolimits: ' + e.message);
+  } finally { limitBusy = false; }
+}
+
+async function buildSet() {
+  if (building || inFlight || pendingAck || !geom.length || !chr) return;
+  building = true; needSet = false;
+  try {
+    const k = (kCounter++ % 250) + 1, prog0 = prog, p0 = pointAt(prog0);
+    let roads = [];
+    if (!activeK) {                                        // Schnellstart: sofort eine Karte nur mit Route, Straßen folgen danach
+      roadsMissing = true; roadsRetryAt = 0;
+      log('Schnellstart: Karte zuerst nur mit Route');
+    } else {
+      const small = roadLevel === 0;                       // erst kleiner, schneller Ausschnitt, danach der volle
+      try {
+        roads = await fetchRoads(p0, small);
+        roadsMissing = false; roadLevel = small ? 1 : 2;
+        log('Straßen geladen (' + (small ? 'Nahbereich' : 'voll') + '): ' + roads.length);
+      } catch (e) {                                        // ohne Straßen bleibt die Karte bei der Route
+        roadsMissing = true; roadsRetryAt = Date.now() + 15000;
+        log('Straßen: ' + e.message + ' (Karte nur mit Route)');
+      }
+    }
+    if (!geom.length || !chr) return;
+    anchors[k] = prog0;
+    lastSetMsgs = buildSetMsgs(k, p0, prog0, roads);
+    setQueue = lastSetMsgs.slice();
+    inFlight = true;                                       // bis der Satz komplett gesendet ist, keinen weiteren bauen
+    log('Kartensatz ' + k + ': ' + setQueue.length + ' Zeilen, ' + lastSetMsgs.join('\n').length + ' Byte');
+    pump();
+  } catch (e) {
+    log('Kartenfehler: ' + e.message);
+    needSet = true; retryAfter = Date.now() + 10000;
+  } finally { building = false; }
+}
+
+// ---------- Positions-Update ----------
+function onPos() {
+  if (!steps.length || !pos || arrived) return;
+  const s = snap(pos);
+  if (s.d > REROUTE_M) {                                   // abseits der Route (3 Messungen in Folge)
+    if (++offCount >= 3) { offCount = 0; setStatus('Berechne neue Route...'); route(); }
+    return;
+  }
+  offCount = 0;
+  if (s.prog >= prog - 30) { prog = Math.max(prog, s.prog); segIdx = s.i; }
+
+  const now = Date.now();                                  // Geschwindigkeit aus dem Routenfortschritt
+  if (prevT) { const dt = (now - prevT) / 1000; if (dt > 0.3) { speed = 0.5 * speed + 0.5 * Math.max(0, Math.min(60, (prog - prevProg) / dt)); prevT = now; prevProg = prog; } }
+  else { prevT = now; prevProg = prog; }
+
+  while (cur < steps.length - 1 && stepStart[cur] - prog < PASSED_M) cur++;   // Manöver passiert
+  const dAlong = Math.max(0, stepStart[cur] - prog);
+
+  if (cur === steps.length - 1 && dAlong < REACHED_M) {
+    arrived = true;
+    post('N', '0|Ziel erreicht'); post('L', 'L|-');
+    setStatus('Ziel erreicht.'); $('dist').textContent = ''; $('text').textContent = 'Ziel erreicht';
+    return;
+  }
+
+  const txt = instruction(steps[cur]);
+  const m = Math.floor(dAlong / 10) * 10;
+  $('dist').textContent = m >= 1000 ? (m / 1000).toFixed(1) + ' km' : m + ' m';
+  $('text').textContent = txt;
+
+  post('N', m + '|' + txt);
+  post('L', buildLaneMsg(dAlong));
+  const nowD = new Date();
+  if (!limitBusy && chr && prog + 700 > limitCoverTo && now > limitRetryAt) refreshLimits();     // Tempolimits rechtzeitig nachladen
+  if (dest) post('T', buildTripMsg(speed, dest, nowD.getHours() * 60 + nowD.getMinutes() + nowD.getSeconds() / 60));
+  if (activeK) post('P', 'P|' + activeK + '|' + Math.round(prog - anchorProg) + '|' + Math.round(dAlong) + '|' + Math.round(speed));
+
+  // neuen Kartenausschnitt holen: noch keiner da, weit gefahren, oder Straßen fehlten beim letzten Mal
+  const due = !activeK || roadLevel === 1 || prog - anchorProg > SET_REFRESH_M || (roadsMissing && now > roadsRetryAt) || (needSet && now > retryAfter);
+  if (!building && !inFlight && !pendingAck && !setQueue.length && due) buildSet();
+
+  const l = lastSent['L'] || '';
+  $('info').textContent = (l.length > 3 ? 'Spurdaten für die nächste Stelle vorhanden' : 'Keine Spurdaten für die nächste Stelle') +
+    ' · Karte: ' + (activeK ? (roadsMissing ? 'nur Route' : 'mit Straßen') : 'wird geladen');
+}
+
+$('btnConnect').onclick = connectWatch;
+$('btnStart').onclick = startNav;
+</script>
+</body>
+</html>
