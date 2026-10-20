@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WatchNav v7</title>
+<title>WatchNav v8</title>
 <style>
   body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 20px; background: #111; color: #eee; }
   h1 { font-size: 20px; margin: 0 0 16px; }
@@ -19,10 +19,11 @@
 </style>
 </head>
 <body>
-<h1>WatchNav – StopWatch-Navigation <small style="color:#789;font-weight:400">Seite v7</small></h1>
+<h1>WatchNav – StopWatch-Navigation <small style="color:#789;font-weight:400">Seite v8</small></h1>
 <button id="btnConnect">1. Uhr verbinden</button>
 <input id="dest" placeholder="Ziel (Adresse oder Ort)" autocomplete="off">
 <button id="btnStart" disabled>2. Navigation starten</button>
+<div id="batRow" style="display:none"><input id="phoneBat" type="number" inputmode="numeric" min="0" max="100" placeholder="iPhone-Akku in % (manuell)"></div>
 <div id="status">Bereit.</div>
 <div id="dist"></div>
 <div id="text"></div>
@@ -32,7 +33,7 @@
 <script>
 // UUIDs müssen zum Sketch passen
 const SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const PAGE_VERSION = 'v7';
+const PAGE_VERSION = 'v8';
 const CHR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // Uhr empfängt (schreiben)
 const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // Uhr antwortet (Bestätigungen)
 
@@ -41,7 +42,7 @@ const RAD = Math.PI / 180, R_EARTH = 6371000;
 const LANE_RANGE = 800;                 // Spurdaten erst ab dieser Entfernung zum Manöver [m]
 const ROUTE_AHEAD = 2000;               // so weit voraus wird die Route für die Karte gesendet [m]
 const SET_REFRESH_M = 200;              // neuer Kartenausschnitt, wenn so weit gefahren [m]
-let geom = [], cumD = [], steps = [], stepStart = [], routeDuration = 0;
+let geom = [], cumD = [], steps = [], stepStart = [], routeDuration = 0, limitSegs = [];
 let cur = 1, prog = 0, segIdx = 0;
 
 function dist2(a, b) {
@@ -64,6 +65,33 @@ function setRoute(coords, stepList, duration) {   // coords: [[lon,lat],...], du
   const k = acc > 0 ? cumD[cumD.length - 1] / acc : 1;      // Schrittlängen an die Geometrie anpassen
   stepStart = raw.map(v => v * k);
   cur = steps.length > 1 ? 1 : 0; prog = 0; segIdx = 0;
+}
+
+// Tempolimit entlang der Route aus den OSRM-Annotationen (distance + maxspeed je Teilstück).
+// Wo OpenStreetMap kein Limit kennt, bleibt es 0 (die Uhr zeigt dann kein Schild).
+function setLimits(legs) {
+  limitSegs = [];
+  let acc = 0;
+  const raw = [];
+  for (const leg of legs || []) {
+    const a = leg.annotation;
+    if (!a || !a.distance || !a.maxspeed) continue;
+    for (let i = 0; i < a.distance.length; i++) {
+      acc += a.distance[i];
+      const m = a.maxspeed[i];
+      let kmh = 0;
+      if (m && typeof m.speed === 'number') kmh = Math.round(m.unit === 'mph' ? m.speed * 1.609 : m.speed);
+      raw.push({ end: acc, kmh });
+    }
+  }
+  const k = acc > 0 ? cumD[cumD.length - 1] / acc : 1;               // an die Geometrie anpassen
+  limitSegs = raw.map(r => ({ end: r.end * k, kmh: r.kmh }));
+}
+function limitAt(p) {
+  let lo = 0, hi = limitSegs.length - 1;
+  if (hi < 0) return 0;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (limitSegs[m].end >= p) hi = m; else lo = m + 1; }
+  return limitSegs[lo].kmh;
 }
 
 function segAt(s) {                     // Segmentindex für Streckenlänge s
@@ -112,7 +140,7 @@ function encPts(pts) {
 }
 
 // Reise-Daten für Tempo-, Reise- und Kompass-Ansicht der Uhr:
-// T|km/h|Kompasswinkel|Luftlinie m|Rest m|Rest s|Uhrzeit (Minuten seit Mitternacht)|Gesamt m|Fahrtrichtung
+// T|km/h|Kompasswinkel|Luftlinie m|Rest m|Rest s|Uhrzeit (Minuten seit Mitternacht)|Gesamt m|Fahrtrichtung|Tempolimit
 function buildTripMsg(speedMs, destPt, nowMin) {
   const total = cumD[cumD.length - 1];
   const p0 = pointAt(prog);
@@ -126,7 +154,7 @@ function buildTripMsg(speedMs, destPt, nowMin) {
   const remM = Math.max(0, total - prog);
   const remS = total > 0 ? routeDuration * remM / total : 0;
   return 'T|' + Math.round(speedMs * 3.6) + '|' + Math.round(rel) + '|' + Math.round(Math.hypot(dv.x, dv.y)) + '|' +
-         Math.round(remM) + '|' + Math.round(remS) + '|' + Math.round(nowMin) + '|' + Math.round(total) + '|' + Math.round(hdgDeg);
+         Math.round(remM) + '|' + Math.round(remS) + '|' + Math.round(nowMin) + '|' + Math.round(total) + '|' + Math.round(hdgDeg) + '|' + limitAt(prog);
 }
 
 // Spurinfo (OSRM liefert sie nur dort, wo OpenStreetMap turn:lanes-Daten hat)
@@ -308,11 +336,12 @@ async function connectWatch() {
       log('Seite ' + PAGE_VERSION + ' · Rückkanal der Uhr aktiv (Häppchen: ' + chunkSize + ' Byte)');
     } catch (e) {
       ackSupported = false;
-      log('Seite ' + PAGE_VERSION + ' · Kein Rückkanal – läuft die NEUE Sketch-Version auf der Uhr? (Sie zeigt "Sketch v6" auf der Akku-Seite)');
+      log('Seite ' + PAGE_VERSION + ' · Kein Rückkanal – läuft die NEUE Sketch-Version auf der Uhr? (Sie zeigt "Sketch v8" auf der Akku-Seite)');
     }
     $('btnStart').disabled = false;
     setStatus('Uhr verbunden.');
     startGps();
+    initPhoneBattery();
   } catch (e) { setStatus('Verbindung fehlgeschlagen: ' + e.message); }
 }
 
@@ -374,7 +403,7 @@ async function pump() {
   pumping = true;
   try {
     for (;;) {
-      const t = ['N', 'L', 'T', 'P'].find(k => outbox[k] !== undefined);
+      const t = ['N', 'L', 'T', 'P', 'B'].find(k => outbox[k] !== undefined);
       let msg;
       if (t) { msg = outbox[t]; delete outbox[t]; lastSent[t] = msg; }
       else if (setQueue.length) msg = setQueue.shift();
@@ -389,6 +418,30 @@ async function pump() {
   }
   pumping = false;
 }
+
+// ---------- iPhone-Akku ----------
+// Safari und Bluefy (iOS) stellen den Akkustand einer Webseite NICHT zur Verfügung (keine Battery-API).
+// Falls der Browser ihn doch liefert, wird er automatisch gesendet; sonst trägst du ihn unten von Hand ein.
+let phoneBat = -1, phoneChg = 0;
+function sendBat() { if (phoneBat >= 0) post('B', 'B|' + phoneBat + '|' + phoneChg); }
+async function initPhoneBattery() {
+  if (navigator.getBattery) {
+    try {
+      const b = await navigator.getBattery();
+      const upd = () => { phoneBat = Math.round(b.level * 100); phoneChg = b.charging ? 1 : 0; sendBat(); };
+      b.addEventListener('levelchange', upd); b.addEventListener('chargingchange', upd); upd();
+      log('iPhone-Akku wird automatisch gelesen: ' + phoneBat + ' %');
+      return;
+    } catch (e) { /* weiter mit manuell */ }
+  }
+  $('batRow').style.display = 'block';
+  log('iPhone-Akku: Browser liefert ihn nicht – bitte unter "Navigation starten" von Hand eintragen');
+}
+$('phoneBat').oninput = () => {
+  const v = parseInt($('phoneBat').value);
+  if (v >= 0 && v <= 100) { phoneBat = v; phoneChg = 0; sendBat(); }
+};
+setInterval(() => { if (chr && phoneBat >= 0) { lastSent['B'] = ''; sendBat(); } }, 60000);   // regelmäßig erneut senden
 
 // ---------- GPS ----------
 function startGps() {
@@ -416,10 +469,14 @@ async function route() {
   busy = true;
   try {
     const url = `https://router.project-osrm.org/route/v1/driving/${pos.lon},${pos.lat};${dest.lon},${dest.lat}?overview=full&geometries=geojson&steps=true`;
-    const j = await (await fetch(url)).json();
+    let j = null;
+    try { j = await (await fetch(url + '&annotations=distance,maxspeed')).json(); } catch (e) { j = null; }
+    if (!j || !j.routes || !j.routes.length) j = await (await fetch(url)).json();      // Server kennt "maxspeed" evtl. nicht
     if (!j.routes || !j.routes.length) throw new Error('Keine Route gefunden');
     const r = j.routes[0];
     setRoute(r.geometry.coordinates, r.legs.flatMap(l => l.steps), r.duration);
+    setLimits(r.legs);
+    log('Tempolimit-Daten: ' + (limitSegs.some(s => s.kmh > 0) ? 'vorhanden' : 'keine für diese Route'));
     arrived = false; offCount = 0; prevProg = 0; prevT = 0; speed = 0;
     activeK = 0; setQueue = []; roadsMissing = false; roadLevel = 0; inFlight = false;   // alter Kartensatz passt nicht mehr
     if (pendingAck) { clearTimeout(pendingAck.timer); pendingAck = null; }
