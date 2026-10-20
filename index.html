@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WatchNav v15</title>
+<title>WatchNav v16</title>
 <style>
   body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 20px; background: #111; color: #eee; }
   h1 { font-size: 20px; margin: 0 0 16px; }
@@ -19,7 +19,7 @@
 </style>
 </head>
 <body>
-<h1>WatchNav – StopWatch-Navigation <small style="color:#789;font-weight:400">Seite v15</small></h1>
+<h1>WatchNav – StopWatch-Navigation <small style="color:#789;font-weight:400">Seite v16</small></h1>
 <button id="btnConnect">1. Uhr verbinden</button>
 <input id="dest" placeholder="Ziel (Adresse oder Ort)" autocomplete="off">
 <button id="btnStart" disabled>2. Navigation starten</button>
@@ -33,14 +33,14 @@
 <script>
 // UUIDs müssen zum Sketch passen
 const SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const PAGE_VERSION = 'v15';
+const PAGE_VERSION = 'v16';
 const CHR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // Uhr empfängt (schreiben)
 const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // Uhr antwortet (Bestätigungen)
 
 // ---- CORE-BEGIN (Routen- und Kartenlogik ohne Browser-Abhängigkeit) ----
 const RAD = Math.PI / 180, R_EARTH = 6371000;
 const LANE_RANGE = 800;                 // Spurdaten erst ab dieser Entfernung zum Manöver [m]
-const ROUTE_AHEAD = 2000;               // so weit voraus wird die Route für die Karte gesendet [m]
+const ROUTE_AHEAD = 3400;               // so weit voraus wird die Route für die Karte gesendet [m]
 const SET_REFRESH_M = 200;              // neuer Kartenausschnitt, wenn so weit gefahren [m]
 let geom = [], cumD = [], steps = [], stepStart = [], routeDuration = 0, limitSegs = [], camProgs = [];
 let cur = 1, prog = 0, segIdx = 0;
@@ -235,8 +235,8 @@ function buildLaneMsg(dAlong) {
 // Klassen: 0 Autobahn, 1 Fernstraße/Bundesstraße, 2 Landesstraße, 3 Kreisstraße, 4 kleine Straßen
 const KIND_OF = { motorway: 0, trunk: 1, primary: 1, motorway_link: 1, secondary: 2, trunk_link: 2, primary_link: 2,
                   tertiary: 3, secondary_link: 3, tertiary_link: 4, residential: 4, unclassified: 4, living_street: 4 };
-const KIND_BUDGET = [6, 12, 16, 24, 44];  // höchstens so viele Straßen je Klasse (insgesamt 66; die Uhr nimmt bis zu 80)  // höchstens so viele Straßen je Klasse (begrenzt die Datenmenge)
-const CLIP_M = 3000, MAX_ROAD_PTS = 6;
+const KIND_BUDGET = [10, 16, 20, 24, 32];  // höchstens so viele Straßen je Klasse (insgesamt 66; die Uhr nimmt bis zu 80)  // höchstens so viele Straßen je Klasse (begrenzt die Datenmenge)
+const CLIP_M = 3800, MAX_ROAD_PTS = 6;
 
 // Zwei Stufen: "klein" (schnell, ~450 m Ausschnitt, alle Straßenklassen) und "voll" (große Straßen weiter hinaus).
 // Rechteck-Filter ist für den Server viel schneller als "around"; out geom(bbox) liefert nur Punkte im Ausschnitt.
@@ -248,10 +248,10 @@ function overpassQuery(p, small) {
   const ALL = 'motorway|trunk|primary|secondary|tertiary|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link|residential|unclassified|living_street';
   const body = small
     ? `way["highway"~"^(${ALL})$"](${bboxStr(p, 450)});`
-    : `way["highway"~"^(motorway|trunk|primary|secondary)$"](${bboxStr(p, 2800)});` +
-      `way["highway"~"^(motorway_link|trunk_link|primary_link|secondary_link|tertiary)$"](${bboxStr(p, 2200)});` +
+    : `way["highway"~"^(motorway|trunk|primary|secondary)$"](${bboxStr(p, 3600)});` +
+      `way["highway"~"^(motorway_link|trunk_link|primary_link|secondary_link|tertiary)$"](${bboxStr(p, 3000)});` +
       `way["highway"~"^(tertiary_link|residential|unclassified|living_street)$"](${bboxStr(p, 1200)});`;
-  return '[out:json][timeout:25];(' + body + `);out tags geom(${bboxStr(p, small ? 450 : 2800)});`;
+  return '[out:json][timeout:25];(' + body + `);out tags geom(${bboxStr(p, small ? 450 : 3600)});`;
 }
 
 function clean(s, n) {                  // Trennzeichen des Protokolls entfernen, kürzen
@@ -326,8 +326,8 @@ function buildSetMsgs(k, p0, prog0, roads) {
   for (;;) {
     rpts.push(xy(pointAt(prog0 + sd), p0));
     if (prog0 + sd >= total) { end = 1; break; }
-    if (sd >= ROUTE_AHEAD || rpts.length >= 48) break;
-    sd += sd < 300 ? 20 : 50;
+    if (sd >= ROUTE_AHEAD || rpts.length >= 60) break;
+    sd += sd < 300 ? 20 : (sd < 1000 ? 50 : 120);     // nah dicht, weit voraus gröber (max. 64 Punkte auf der Uhr)
   }
   const msgs = ['W|' + k, 'Q|' + k + '|' + end + '|' + encPts(rpts)];
   for (const r of roads) msgs.push('R|' + k + '|' + r.kind + '|' + r.ref + '|' + r.name + '|' + encPts(r.pts));
@@ -401,7 +401,7 @@ async function connectWatch() {
       log('Seite ' + PAGE_VERSION + ' · Rückkanal der Uhr aktiv (Häppchen: ' + chunkSize + ' Byte)');
     } catch (e) {
       ackSupported = false;
-      log('Seite ' + PAGE_VERSION + ' · Kein Rückkanal – läuft die NEUE Sketch-Version auf der Uhr? (Sie zeigt "Sketch v13" auf der Akku-Seite)');
+      log('Seite ' + PAGE_VERSION + ' · Kein Rückkanal – läuft die NEUE Sketch-Version auf der Uhr? (Sie zeigt "Sketch v18" in der Info-Ansicht)');
     }
     $('btnStart').disabled = false;
     setStatus('Uhr verbunden.');
