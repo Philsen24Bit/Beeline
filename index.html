@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WatchNav v14</title>
+<title>WatchNav v15</title>
 <style>
   body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 20px; background: #111; color: #eee; }
   h1 { font-size: 20px; margin: 0 0 16px; }
@@ -19,7 +19,7 @@
 </style>
 </head>
 <body>
-<h1>WatchNav – StopWatch-Navigation <small style="color:#789;font-weight:400">Seite v14</small></h1>
+<h1>WatchNav – StopWatch-Navigation <small style="color:#789;font-weight:400">Seite v15</small></h1>
 <button id="btnConnect">1. Uhr verbinden</button>
 <input id="dest" placeholder="Ziel (Adresse oder Ort)" autocomplete="off">
 <button id="btnStart" disabled>2. Navigation starten</button>
@@ -33,7 +33,7 @@
 <script>
 // UUIDs müssen zum Sketch passen
 const SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const PAGE_VERSION = 'v14';
+const PAGE_VERSION = 'v15';
 const CHR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // Uhr empfängt (schreiben)
 const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // Uhr antwortet (Bestätigungen)
 
@@ -235,7 +235,7 @@ function buildLaneMsg(dAlong) {
 // Klassen: 0 Autobahn, 1 Fernstraße/Bundesstraße, 2 Landesstraße, 3 Kreisstraße, 4 kleine Straßen
 const KIND_OF = { motorway: 0, trunk: 1, primary: 1, motorway_link: 1, secondary: 2, trunk_link: 2, primary_link: 2,
                   tertiary: 3, secondary_link: 3, tertiary_link: 4, residential: 4, unclassified: 4, living_street: 4 };
-const KIND_BUDGET = [6, 12, 16, 24, 22];  // höchstens so viele Straßen je Klasse (insgesamt 66; die Uhr nimmt bis zu 80)  // höchstens so viele Straßen je Klasse (begrenzt die Datenmenge)
+const KIND_BUDGET = [6, 12, 16, 24, 44];  // höchstens so viele Straßen je Klasse (insgesamt 66; die Uhr nimmt bis zu 80)  // höchstens so viele Straßen je Klasse (begrenzt die Datenmenge)
 const CLIP_M = 3000, MAX_ROAD_PTS = 6;
 
 // Zwei Stufen: "klein" (schnell, ~450 m Ausschnitt, alle Straßenklassen) und "voll" (große Straßen weiter hinaus).
@@ -250,7 +250,7 @@ function overpassQuery(p, small) {
     ? `way["highway"~"^(${ALL})$"](${bboxStr(p, 450)});`
     : `way["highway"~"^(motorway|trunk|primary|secondary)$"](${bboxStr(p, 2800)});` +
       `way["highway"~"^(motorway_link|trunk_link|primary_link|secondary_link|tertiary)$"](${bboxStr(p, 2200)});` +
-      `way["highway"~"^(tertiary_link|residential|unclassified|living_street)$"](${bboxStr(p, 550)});`;
+      `way["highway"~"^(tertiary_link|residential|unclassified|living_street)$"](${bboxStr(p, 1200)});`;
   return '[out:json][timeout:25];(' + body + `);out tags geom(${bboxStr(p, small ? 450 : 2800)});`;
 }
 
